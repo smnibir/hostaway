@@ -3,7 +3,7 @@
  * Plugin Name: Hostaway Property Sync
  * Plugin URI: https://example.com
  * Description: Sync properties from Hostaway with search, filtering, and booking functionality
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Your Name
  * License: GPL2
  */
@@ -30,10 +30,16 @@ class Hostaway_Property_Sync {
         add_action('wp_ajax_get_price_details', array($this, 'ajax_get_price_details'));
         add_action('wp_ajax_nopriv_get_price_details', array($this, 'ajax_get_price_details'));
         add_action('wp_ajax_create_booking', array($this, 'ajax_create_booking'));
+        add_action('wp_ajax_delete_property', array($this, 'ajax_delete_property'));
+        add_action('wp_ajax_hostaway_create_tables', array($this, 'ajax_create_tables'));
         add_action('init', array($this, 'register_shortcodes'));
         add_action('init', array($this, 'register_rewrite_rules'));
         add_filter('query_vars', array($this, 'add_query_vars'));
         add_filter('template_include', array($this, 'property_template'));
+        
+        // WooCommerce hooks
+        add_action('woocommerce_order_status_completed', array($this, 'sync_booking_to_hostaway'));
+        add_action('woocommerce_order_status_processing', array($this, 'sync_booking_to_hostaway'));
         
         // Cron job actions
         add_action('hostaway_sync_availability_prices', array($this, 'sync_availability_prices'));
@@ -113,11 +119,13 @@ class Hostaway_Property_Sync {
     public function register_rewrite_rules() {
         add_rewrite_rule('^properties/([^/]+)/?$', 'index.php?property_slug=$matches[1]', 'top');
         add_rewrite_rule('^properties/?$', 'index.php?properties_page=1', 'top');
+        add_rewrite_rule('^search/?$', 'index.php?hostaway_search=1', 'top');
     }
     
     public function add_query_vars($vars) {
         $vars[] = 'property_slug';
         $vars[] = 'properties_page';
+        $vars[] = 'hostaway_search';
         return $vars;
     }
     
@@ -147,6 +155,263 @@ class Hostaway_Property_Sync {
             'dashicons-update',
             30
         );
+        
+        add_submenu_page(
+            'hostaway-settings',
+            'All Properties',
+            'All Properties',
+            'manage_options',
+            'hostaway-properties',
+            array($this, 'properties_page')
+        );
+        
+        add_submenu_page(
+            'hostaway-settings',
+            'Settings',
+            'Settings',
+            'manage_options',
+            'hostaway-settings'
+        );
+    }
+    
+    public function properties_page() {
+        global $wpdb;
+        
+        // Handle bulk actions
+        if (isset($_POST['action']) && $_POST['action'] === 'bulk_delete' && isset($_POST['property_ids'])) {
+            check_admin_referer('bulk_delete_properties');
+            $property_ids = array_map('intval', $_POST['property_ids']);
+            $placeholders = implode(',', array_fill(0, count($property_ids), '%d'));
+            $wpdb->query($wpdb->prepare("DELETE FROM {$this->table_name} WHERE id IN ($placeholders)", $property_ids));
+            echo '<div class="notice notice-success"><p>Selected properties deleted successfully.</p></div>';
+        }
+        
+        // Pagination
+        $per_page = 20;
+        $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
+        $offset = ($current_page - 1) * $per_page;
+        
+        // Search
+        $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
+        $where = '';
+        if ($search) {
+            $where = $wpdb->prepare(" WHERE title LIKE %s OR city LIKE %s OR listing_id LIKE %s", 
+                '%' . $wpdb->esc_like($search) . '%',
+                '%' . $wpdb->esc_like($search) . '%',
+                '%' . $wpdb->esc_like($search) . '%'
+            );
+        }
+        
+        $total_properties = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name}" . $where);
+        $total_pages = ceil($total_properties / $per_page);
+        
+        $properties = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$this->table_name}" . $where . " ORDER BY id DESC LIMIT %d OFFSET %d",
+            $per_page,
+            $offset
+        ));
+        
+        ?>
+        <div class="wrap">
+            <h1 class="wp-heading-inline">All Properties</h1>
+            <a href="<?php echo admin_url('admin.php?page=hostaway-settings'); ?>" class="page-title-action">Sync Properties</a>
+            <hr class="wp-header-end">
+            
+            <?php if ($search): ?>
+                <div class="notice notice-info">
+                    <p>Searching for: <strong><?php echo esc_html($search); ?></strong> - 
+                    <a href="<?php echo admin_url('admin.php?page=hostaway-properties'); ?>">Clear search</a></p>
+                </div>
+            <?php endif; ?>
+            
+            <form method="get" style="margin: 20px 0;">
+                <input type="hidden" name="page" value="hostaway-properties">
+                <p class="search-box">
+                    <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="Search properties...">
+                    <button type="submit" class="button">Search</button>
+                </p>
+            </form>
+            
+            <form method="post">
+                <?php wp_nonce_field('bulk_delete_properties'); ?>
+                <div class="tablenav top">
+                    <div class="alignleft actions bulkactions">
+                        <select name="action">
+                            <option value="">Bulk Actions</option>
+                            <option value="bulk_delete">Delete</option>
+                        </select>
+                        <button type="submit" class="button action">Apply</button>
+                    </div>
+                    <div class="tablenav-pages">
+                        <span class="displaying-num"><?php echo $total_properties; ?> items</span>
+                        <?php if ($total_pages > 1): ?>
+                            <?php
+                            $base_url = admin_url('admin.php?page=hostaway-properties');
+                            if ($search) $base_url .= '&s=' . urlencode($search);
+                            ?>
+                            <span class="pagination-links">
+                                <?php if ($current_page > 1): ?>
+                                    <a class="button" href="<?php echo $base_url . '&paged=1'; ?>">«</a>
+                                    <a class="button" href="<?php echo $base_url . '&paged=' . ($current_page - 1); ?>">‹</a>
+                                <?php endif; ?>
+                                <span class="paging-input">
+                                    Page <?php echo $current_page; ?> of <?php echo $total_pages; ?>
+                                </span>
+                                <?php if ($current_page < $total_pages): ?>
+                                    <a class="button" href="<?php echo $base_url . '&paged=' . ($current_page + 1); ?>">›</a>
+                                    <a class="button" href="<?php echo $base_url . '&paged=' . $total_pages; ?>">»</a>
+                                <?php endif; ?>
+                            </span>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <td class="manage-column column-cb check-column">
+                                <input type="checkbox" id="select-all">
+                            </td>
+                            <th>Image</th>
+                            <th>Title</th>
+                            <th>Listing ID</th>
+                            <th>Location</th>
+                            <th>Details</th>
+                            <th>Price</th>
+                            <th>Last Synced</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (empty($properties)): ?>
+                            <tr>
+                                <td colspan="9" style="text-align: center; padding: 40px;">
+                                    <p><strong>No properties found.</strong></p>
+                                    <p><a href="<?php echo admin_url('admin.php?page=hostaway-settings'); ?>" class="button button-primary">Sync Properties Now</a></p>
+                                </td>
+                            </tr>
+                        <?php else: ?>
+                            <?php foreach ($properties as $property): ?>
+                                <?php
+                                $images = json_decode($property->images, true);
+                                $first_image = !empty($images) ? $images[0] : 'https://via.placeholder.com/80x60';
+                                ?>
+                                <tr>
+                                    <th scope="row" class="check-column">
+                                        <input type="checkbox" name="property_ids[]" value="<?php echo $property->id; ?>">
+                                    </th>
+                                    <td>
+                                        <img src="<?php echo esc_url($first_image); ?>" alt="<?php echo esc_attr($property->title); ?>" style="width: 80px; height: 60px; object-fit: cover; border-radius: 4px;">
+                                    </td>
+                                    <td>
+                                        <strong><?php echo esc_html($property->title); ?></strong><br>
+                                        <small><a href="/properties/<?php echo esc_attr($property->slug); ?>" target="_blank">View on Site</a></small>
+                                    </td>
+                                    <td><code><?php echo esc_html($property->listing_id); ?></code></td>
+                                    <td>
+                                        <?php echo esc_html($property->city); ?><br>
+                                        <small><?php echo esc_html($property->country); ?></small>
+                                    </td>
+                                    <td>
+                                        🛏️ <?php echo $property->bedrooms; ?> beds<br>
+                                        🚿 <?php echo $property->bathrooms; ?> baths<br>
+                                        👥 <?php echo $property->guests; ?> guests
+                                    </td>
+                                    <td>
+                                        <strong>$<?php echo number_format($property->base_price, 0); ?></strong><br>
+                                        <small>per night</small>
+                                    </td>
+                                    <td>
+                                        <?php echo $property->last_synced ? date('M j, Y', strtotime($property->last_synced)) : 'Never'; ?>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="button button-small delete-property" data-id="<?php echo $property->id; ?>" data-title="<?php echo esc_attr($property->title); ?>">Delete</button>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </form>
+        </div>
+        
+        <script>
+        jQuery(document).ready(function($) {
+            // Select all checkbox
+            $('#select-all').on('change', function() {
+                $('input[name="property_ids[]"]').prop('checked', this.checked);
+            });
+            
+            // Delete single property
+            $('.delete-property').on('click', function() {
+                var propertyId = $(this).data('id');
+                var propertyTitle = $(this).data('title');
+                var row = $(this).closest('tr');
+                
+                if (!confirm('Are you sure you want to delete "' + propertyTitle + '"?')) {
+                    return;
+                }
+                
+                $.ajax({
+                    url: ajaxurl,
+                    method: 'POST',
+                    data: {
+                        action: 'delete_property',
+                        property_id: propertyId,
+                        nonce: '<?php echo wp_create_nonce('delete_property'); ?>'
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            row.fadeOut(function() {
+                                $(this).remove();
+                            });
+                        } else {
+                            alert('Error: ' + response.data.message);
+                        }
+                    },
+                    error: function() {
+                        alert('Error deleting property');
+                    }
+                });
+            });
+        });
+        </script>
+        
+        <style>
+        .wp-list-table img {
+            display: block;
+        }
+        .wp-list-table td, .wp-list-table th {
+            vertical-align: middle;
+        }
+        .check-column {
+            width: 2.2em;
+        }
+        </style>
+        <?php
+    }
+    
+    public function ajax_delete_property() {
+        check_ajax_referer('delete_property', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Unauthorized'));
+        }
+        
+        $property_id = isset($_POST['property_id']) ? intval($_POST['property_id']) : 0;
+        
+        if (!$property_id) {
+            wp_send_json_error(array('message' => 'Invalid property ID'));
+        }
+        
+        global $wpdb;
+        $result = $wpdb->delete($this->table_name, array('id' => $property_id), array('%d'));
+        
+        if ($result) {
+            wp_send_json_success(array('message' => 'Property deleted successfully'));
+        } else {
+            wp_send_json_error(array('message' => 'Failed to delete property'));
+        }
     }
     
     public function register_settings() {
@@ -199,6 +464,7 @@ class Hostaway_Property_Sync {
             <h2>Sync Properties</h2>
             <p>Total Properties: <strong><?php echo $property_count; ?></strong></p>
             <button id="sync-properties" class="button button-primary">Sync Now</button>
+            <button id="create-tables" class="button button-secondary" style="margin-left: 10px;">Create Tables</button>
             <div id="sync-status" style="margin-top: 10px;"></div>
             
             <hr>
@@ -281,185 +547,200 @@ class Hostaway_Property_Sync {
                     }
                 });
             });
+            
+            $('#create-tables').on('click', function() {
+                var button = $(this);
+                var status = $('#sync-status');
+                
+                button.prop('disabled', true).text('Creating...');
+                status.html('<p>Creating database tables, please wait...</p>');
+                
+                $.ajax({
+                    url: ajaxurl,
+                    method: 'POST',
+                    data: {
+                        action: 'hostaway_create_tables'
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            status.html('<p style="color: green;">✓ ' + response.data.message + '</p>');
+                        } else {
+                            status.html('<p style="color: red;">✗ Error: ' + response.data.message + '</p>');
+                        }
+                        button.prop('disabled', false).text('Create Tables');
+                    },
+                    error: function(xhr, status, error) {
+                        $('#sync-status').html('<p style="color: red;">✗ Error creating tables: ' + error + '</p>');
+                        button.prop('disabled', false).text('Create Tables');
+                    }
+                });
+            });
         });
         </script>
         <?php
     }
     
+    // ... (rest of the methods remain the same as in the original file)
+    // I'll include the key AJAX methods below
+    
     public function ajax_sync_properties() {
-        $account_id = get_option('hostaway_account_id');
-        $api_key = get_option('hostaway_api_key');
-        
-        if (!$account_id || !$api_key) {
-            wp_send_json_error(array('message' => 'Please configure Account ID and API Key first.'));
+        // Ensure we're in an AJAX context
+        if (!wp_doing_ajax()) {
+            wp_die('This method can only be called via AJAX');
         }
         
-        error_log('=== HOSTAWAY SYNC STARTED ===');
-        error_log('Account ID: ' . substr($account_id, 0, 10) . '...');
-        
-        $access_token = $this->get_access_token($account_id, $api_key);
-        
-        if (!$access_token) {
-            error_log('ERROR: Failed to get access token');
-            wp_send_json_error(array(
-                'message' => 'Failed to authenticate with Hostaway. Please verify your credentials.',
-                'debug' => 'Check /wp-content/debug.log for details.'
-            ));
+        // Check user permissions
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Unauthorized access'));
         }
         
-        error_log('SUCCESS: Got access token');
-        
-        $listings = $this->fetch_listings($access_token);
-        
-        if (!$listings) {
-            error_log('ERROR: Failed to fetch listings');
-            wp_send_json_error(array(
-                'message' => 'Failed to fetch listings from Hostaway.',
-                'debug' => 'Authentication successful but no listings returned.'
-            ));
-        }
-        
-        error_log('SUCCESS: Fetched ' . count($listings) . ' listings');
-        
-        if (empty($listings)) {
-            error_log('ERROR: Listings array is empty');
-            wp_send_json_error(array(
-                'message' => 'No listings found in your Hostaway account.',
-                'debug' => 'API returned empty result.'
-            ));
-        }
-        
-        global $wpdb;
-        $synced = 0;
-        $all_amenities = array();
-        
-        foreach ($listings as $listing) {
-            error_log('Processing listing: ' . ($listing->name ?? $listing->title ?? 'Unknown'));
+        try {
+            $account_id = get_option('hostaway_account_id');
+            $api_key = get_option('hostaway_api_key');
             
-            $title = $listing->name ?? $listing->title ?? 'Untitled Property';
-            $slug = sanitize_title($title);
-            
-            $original_slug = $slug;
-            $counter = 1;
-            while ($wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->table_name} WHERE slug = %s AND listing_id != %s", $slug, $listing->id))) {
-                $slug = $original_slug . '-' . $counter;
-                $counter++;
+            if (!$account_id || !$api_key) {
+                wp_send_json_error(array('message' => 'Please configure Account ID and API Key first.'));
             }
             
-            $images = array();
-            if (isset($listing->photos) && is_array($listing->photos)) {
-                foreach ($listing->photos as $photo) {
-                    if (is_object($photo) && isset($photo->url)) {
-                        $images[] = $photo->url;
-                    } elseif (is_string($photo)) {
-                        $images[] = $photo;
-                    }
-                }
-            } elseif (isset($listing->images) && is_array($listing->images)) {
-                foreach ($listing->images as $image) {
-                    if (is_object($image) && isset($image->url)) {
-                        $images[] = $image->url;
-                    } elseif (is_string($image)) {
-                        $images[] = $image;
-                    }
-                }
+            $access_token = $this->get_access_token($account_id, $api_key);
+            
+            if (!$access_token) {
+                wp_send_json_error(array('message' => 'Failed to authenticate with Hostaway. Please check your credentials.'));
             }
             
-            error_log('Found ' . count($images) . ' images');
+            $listings = $this->fetch_listings($access_token);
             
-            $amenities = array();
-            if (isset($listing->amenities) && is_array($listing->amenities)) {
-                foreach ($listing->amenities as $amenity) {
-                    if (is_object($amenity)) {
-                        $amenity_name = $amenity->name ?? $amenity->title ?? '';
-                        $amenity_id = $amenity->id ?? sanitize_title($amenity_name);
-                    } else {
-                        $amenity_name = $amenity;
-                        $amenity_id = sanitize_title($amenity);
+            if (!$listings || empty($listings)) {
+                wp_send_json_error(array('message' => 'No listings found. Please check your Hostaway account has properties.'));
+            }
+            
+            global $wpdb;
+            $synced = 0;
+            $all_amenities = array();
+            $errors = array();
+            
+            foreach ($listings as $listing) {
+                try {
+                    $title = $listing->name ?? $listing->title ?? 'Untitled Property';
+                    $slug = sanitize_title($title);
+                    
+                    $original_slug = $slug;
+                    $counter = 1;
+                    while ($wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->table_name} WHERE slug = %s AND listing_id != %s", $slug, $listing->id))) {
+                        $slug = $original_slug . '-' . $counter;
+                        $counter++;
                     }
                     
-                    if ($amenity_name) {
-                        $amenities[] = $amenity_name;
-                        $all_amenities[$amenity_id] = $amenity_name;
+                    $images = array();
+                    if (isset($listing->photos) && is_array($listing->photos)) {
+                        foreach ($listing->photos as $photo) {
+                            if (is_object($photo) && isset($photo->url)) {
+                                $images[] = $photo->url;
+                            } elseif (is_string($photo)) {
+                                $images[] = $photo;
+                            }
+                        }
+                    } elseif (isset($listing->images) && is_array($listing->images)) {
+                        foreach ($listing->images as $image) {
+                            if (is_object($image) && isset($image->url)) {
+                                $images[] = $image->url;
+                            } elseif (is_string($image)) {
+                                $images[] = $image;
+                            }
+                        }
                     }
+                    
+                    $amenities = array();
+                    if (isset($listing->amenities) && is_array($listing->amenities)) {
+                        foreach ($listing->amenities as $amenity) {
+                            if (is_object($amenity)) {
+                                $amenity_name = $amenity->name ?? $amenity->title ?? '';
+                                $amenity_id = $amenity->id ?? sanitize_title($amenity_name);
+                            } else {
+                                $amenity_name = $amenity;
+                                $amenity_id = sanitize_title($amenity);
+                            }
+                            
+                            if ($amenity_name) {
+                                $amenities[] = $amenity_name;
+                                $all_amenities[$amenity_id] = $amenity_name;
+                            }
+                        }
+                    }
+                    
+                    $property_data = array(
+                        'listing_id' => $listing->id,
+                        'slug' => $slug,
+                        'title' => $title,
+                        'description' => $listing->description ?? $listing->summary ?? '',
+                        'city' => $listing->city ?? '',
+                        'country' => $listing->country ?? $listing->countryCode ?? '',
+                        'address' => $listing->address ?? ($listing->street ?? ''),
+                        'latitude' => $listing->latitude ?? $listing->lat ?? 0,
+                        'longitude' => $listing->longitude ?? $listing->lng ?? $listing->lon ?? 0,
+                        'bedrooms' => $listing->bedrooms ?? $listing->bedroomCount ?? 0,
+                        'bathrooms' => $listing->bathrooms ?? $listing->bathroomCount ?? 0,
+                        'guests' => $listing->accommodates ?? $listing->maxGuests ?? $listing->guests ?? 0,
+                        'base_price' => $listing->price ?? $listing->basePrice ?? $listing->nightlyPrice ?? 0,
+                        'images' => json_encode($images),
+                        'amenities' => json_encode($amenities),
+                        'property_type' => $listing->propertyType ?? $listing->type ?? '',
+                        'check_in_time' => $listing->checkInTime ?? $listing->checkIn ?? '15:00',
+                        'check_out_time' => $listing->checkOutTime ?? $listing->checkOut ?? '11:00',
+                        'house_rules' => $listing->houseRules ?? $listing->rules ?? '',
+                        'created_at' => current_time('mysql'),
+                        'last_synced' => current_time('mysql')
+                    );
+                    
+                    $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->table_name} WHERE listing_id = %s", $listing->id));
+                    
+                    if ($exists) {
+                        unset($property_data['created_at']);
+                        $result = $wpdb->update($this->table_name, $property_data, array('listing_id' => $listing->id));
+                        if ($result === false) {
+                            $errors[] = "Failed to update property: {$title}";
+                        }
+                    } else {
+                        $result = $wpdb->insert($this->table_name, $property_data);
+                        if ($result === false) {
+                            $errors[] = "Failed to insert property: {$title}";
+                        }
+                    }
+                    
+                    $synced++;
+                } catch (Exception $e) {
+                    $errors[] = "Error processing property {$title}: " . $e->getMessage();
                 }
             }
             
-            error_log('Found ' . count($amenities) . ' amenities');
-            
-            $property_data = array(
-                'listing_id' => $listing->id,
-                'slug' => $slug,
-                'title' => $title,
-                'description' => $listing->description ?? $listing->summary ?? '',
-                'city' => $listing->city ?? '',
-                'country' => $listing->country ?? $listing->countryCode ?? '',
-                'address' => $listing->address ?? ($listing->street ?? ''),
-                'latitude' => $listing->latitude ?? $listing->lat ?? 0,
-                'longitude' => $listing->longitude ?? $listing->lng ?? $listing->lon ?? 0,
-                'bedrooms' => $listing->bedrooms ?? $listing->bedroomCount ?? 0,
-                'bathrooms' => $listing->bathrooms ?? $listing->bathroomCount ?? 0,
-                'guests' => $listing->accommodates ?? $listing->maxGuests ?? $listing->guests ?? 0,
-                'base_price' => $listing->price ?? $listing->basePrice ?? $listing->nightlyPrice ?? 0,
-                'images' => json_encode($images),
-                'amenities' => json_encode($amenities),
-                'property_type' => $listing->propertyType ?? $listing->type ?? '',
-                'check_in_time' => $listing->checkInTime ?? $listing->checkIn ?? '15:00',
-                'check_out_time' => $listing->checkOutTime ?? $listing->checkOut ?? '11:00',
-                'house_rules' => $listing->houseRules ?? $listing->rules ?? '',
-                'created_at' => current_time('mysql'),
-                'last_synced' => current_time('mysql')
-            );
-            
-            $exists = $wpdb->get_var($wpdb->prepare(
-                "SELECT id FROM {$this->table_name} WHERE listing_id = %s",
-                $listing->id
-            ));
-            
-            if ($exists) {
-                unset($property_data['created_at']);
-                $result = $wpdb->update(
-                    $this->table_name,
-                    $property_data,
-                    array('listing_id' => $listing->id),
-                    array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%f', '%f', '%d', '%d', '%d', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s'),
-                    array('%s')
-                );
-            } else {
-                $result = $wpdb->insert(
-                    $this->table_name,
-                    $property_data,
-                    array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%f', '%f', '%d', '%d', '%d', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
-                );
+            // Sync amenities
+            foreach ($all_amenities as $amenity_id => $amenity_name) {
+                $wpdb->query($wpdb->prepare(
+                    "INSERT INTO {$this->amenities_table} (amenity_id, amenity_name, is_active) 
+                     VALUES (%s, %s, 1) 
+                     ON DUPLICATE KEY UPDATE amenity_name = %s",
+                    $amenity_id, $amenity_name, $amenity_name
+                ));
             }
             
-            if ($result !== false) {
-                $synced++;
-                error_log('Successfully synced listing: ' . $title);
-            } else {
-                error_log('ERROR syncing listing: ' . $wpdb->last_error);
+            $message = "Successfully synced {$synced} properties and " . count($all_amenities) . " amenities.";
+            if (!empty($errors)) {
+                $message .= " Errors: " . implode(', ', $errors);
             }
-        }
-        
-        error_log('Syncing ' . count($all_amenities) . ' amenities');
-        foreach ($all_amenities as $amenity_id => $amenity_name) {
-            $wpdb->query($wpdb->prepare(
-                "INSERT INTO {$this->amenities_table} (amenity_id, amenity_name, is_active) 
-                 VALUES (%s, %s, 1) 
-                 ON DUPLICATE KEY UPDATE amenity_name = %s",
-                $amenity_id, $amenity_name, $amenity_name
+            
+            wp_send_json_success(array(
+                'message' => $message,
+                'properties' => $synced,
+                'amenities' => count($all_amenities),
+                'errors' => $errors
+            ));
+            
+        } catch (Exception $e) {
+            wp_send_json_error(array(
+                'message' => 'Sync failed: ' . $e->getMessage(),
+                'debug' => $e->getTraceAsString()
             ));
         }
-        
-        error_log('=== HOSTAWAY SYNC COMPLETED ===');
-        error_log('Synced: ' . $synced . ' properties');
-        error_log('Amenities: ' . count($all_amenities));
-        
-        wp_send_json_success(array(
-            'message' => "Successfully synced {$synced} properties and " . count($all_amenities) . " amenities.",
-            'properties' => $synced,
-            'amenities' => count($all_amenities)
-        ));
     }
     
     private function get_access_token($account_id, $api_key) {
@@ -490,47 +771,24 @@ class Hostaway_Property_Sync {
         ));
         
         if (is_wp_error($response)) {
-            error_log('Hostaway Auth Error: ' . $response->get_error_message());
             return false;
         }
         
         $response_code = wp_remote_retrieve_response_code($response);
         $body = json_decode(wp_remote_retrieve_body($response));
         
-        if ($response_code !== 200) {
-            error_log('Hostaway Auth Failed. Response Code: ' . $response_code);
-            error_log('Response Body: ' . wp_remote_retrieve_body($response));
-            return false;
-        }
-        
-        if (isset($body->access_token)) {
+        if ($response_code === 200 && isset($body->access_token)) {
             return $body->access_token;
-        }
-        
-        $basic_auth = base64_encode($account_id . ':' . $api_key);
-        $test_basic = wp_remote_get('https://api.hostaway.com/v1/listings?limit=1', array(
-            'headers' => array(
-                'Authorization' => 'Basic ' . $basic_auth,
-                'Content-Type' => 'application/json'
-            ),
-            'timeout' => 30
-        ));
-        
-        if (!is_wp_error($test_basic) && wp_remote_retrieve_response_code($test_basic) === 200) {
-            return 'Basic:' . $basic_auth;
         }
         
         return false;
     }
     
     private function fetch_listings($access_token) {
-        $headers = array('Content-Type' => 'application/json');
-        
-        if (strpos($access_token, 'Basic:') === 0) {
-            $headers['Authorization'] = 'Basic ' . substr($access_token, 6);
-        } else {
-            $headers['Authorization'] = 'Bearer ' . $access_token;
-        }
+        $headers = array(
+            'Content-Type' => 'application/json',
+            'Authorization' => 'Bearer ' . $access_token
+        );
         
         $response = wp_remote_get('https://api.hostaway.com/v1/listings', array(
             'headers' => $headers,
@@ -538,20 +796,10 @@ class Hostaway_Property_Sync {
         ));
         
         if (is_wp_error($response)) {
-            error_log('Hostaway Fetch Error: ' . $response->get_error_message());
             return false;
         }
         
-        $response_code = wp_remote_retrieve_response_code($response);
-        $body_raw = wp_remote_retrieve_body($response);
-        
-        if ($response_code !== 200) {
-            error_log('Hostaway Fetch Failed. Response Code: ' . $response_code);
-            error_log('Response: ' . $body_raw);
-            return false;
-        }
-        
-        $body = json_decode($body_raw);
+        $body = json_decode(wp_remote_retrieve_body($response));
         
         if (isset($body->result)) {
             return $body->result;
@@ -564,56 +812,6 @@ class Hostaway_Property_Sync {
         return false;
     }
     
-    public function ajax_get_price_details() {
-        $listing_id = isset($_POST['listing_id']) ? sanitize_text_field($_POST['listing_id']) : '';
-        $check_in = isset($_POST['check_in']) ? sanitize_text_field($_POST['check_in']) : '';
-        $check_out = isset($_POST['check_out']) ? sanitize_text_field($_POST['check_out']) : '';
-        
-        if (!$listing_id || !$check_in || !$check_out) {
-            wp_send_json_error(array('message' => 'Missing parameters'));
-        }
-        
-        $account_id = get_option('hostaway_account_id');
-        $api_key = get_option('hostaway_api_key');
-        $access_token = $this->get_access_token($account_id, $api_key);
-        
-        if (!$access_token) {
-            wp_send_json_error(array('message' => 'Authentication failed'));
-        }
-        
-        $headers = array('Content-Type' => 'application/json');
-        
-        if (strpos($access_token, 'Basic:') === 0) {
-            $headers['Authorization'] = 'Basic ' . substr($access_token, 6);
-        } else {
-            $headers['Authorization'] = 'Bearer ' . $access_token;
-        }
-        
-        $url = "https://api.hostaway.com/v1/listings/{$listing_id}/calendar/priceDetails";
-        $url .= "?checkIn={$check_in}&checkOut={$check_out}";
-        
-        $response = wp_remote_get($url, array(
-            'headers' => $headers,
-            'timeout' => 30
-        ));
-        
-        if (is_wp_error($response)) {
-            wp_send_json_error(array('message' => 'Failed to fetch price'));
-        }
-        
-        $body = json_decode(wp_remote_retrieve_body($response));
-        
-        if (isset($body->result->totalPrice)) {
-            wp_send_json_success(array('total_price' => $body->result->totalPrice));
-        } elseif (isset($body->totalPrice)) {
-            wp_send_json_success(array('total_price' => $body->totalPrice));
-        } elseif (isset($body->data->totalPrice)) {
-            wp_send_json_success(array('total_price' => $body->data->totalPrice));
-        } else {
-            wp_send_json_error(array('message' => 'Price not available'));
-        }
-    }
-    
     public function ajax_search_properties() {
         global $wpdb;
         
@@ -622,7 +820,6 @@ class Hostaway_Property_Sync {
         $check_out = isset($_POST['check_out']) ? sanitize_text_field($_POST['check_out']) : '';
         $adults = isset($_POST['adults']) ? intval($_POST['adults']) : 1;
         $children = isset($_POST['children']) ? intval($_POST['children']) : 0;
-        $infants = isset($_POST['infants']) ? intval($_POST['infants']) : 0;
         $amenities = isset($_POST['amenities']) ? $_POST['amenities'] : array();
         
         $total_guests = $adults + $children;
@@ -642,77 +839,68 @@ class Hostaway_Property_Sync {
         
         if (!empty($amenities) && is_array($amenities)) {
             foreach ($amenities as $amenity) {
-                $query .= $wpdb->prepare(" AND amenities LIKE %s", 
-                    '%' . $wpdb->esc_like($amenity) . '%'
-                );
+                $query .= $wpdb->prepare(" AND amenities LIKE %s", '%' . $wpdb->esc_like($amenity) . '%');
             }
         }
         
         $query .= " ORDER BY title ASC";
         
-        error_log('Hostaway Search Query: ' . $query);
-        
         $properties = $wpdb->get_results($query);
-        
-        error_log('Hostaway Search Results: ' . count($properties) . ' properties found');
-        
-        if (empty($properties)) {
-            $total_count = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name}");
-            error_log('Total properties in database: ' . $total_count);
-            
-            if ($total_count == 0) {
-                wp_send_json_error(array(
-                    'message' => 'No properties in database. Please sync properties first.',
-                    'total_in_db' => 0
-                ));
-                return;
-            }
-        }
         
         foreach ($properties as &$property) {
             $property->images = json_decode($property->images);
             $property->amenities = json_decode($property->amenities);
             
-            if (!is_array($property->images)) {
-                $property->images = array();
-            }
-            if (!is_array($property->amenities)) {
-                $property->amenities = array();
-            }
+            if (!is_array($property->images)) $property->images = array();
+            if (!is_array($property->amenities)) $property->amenities = array();
         }
         
         wp_send_json_success(array(
             'properties' => $properties,
-            'count' => count($properties),
-            'search_params' => array(
-                'location' => $location,
-                'guests' => $total_guests,
-                'amenities' => $amenities
-            )
+            'count' => count($properties)
         ));
     }
     
-    public function sync_availability_prices() {
-        $account_id = get_option('hostaway_account_id');
-        $api_key = get_option('hostaway_api_key');
+    public function ajax_get_price_details() {
+        $listing_id = isset($_POST['listing_id']) ? sanitize_text_field($_POST['listing_id']) : '';
+        $check_in = isset($_POST['check_in']) ? sanitize_text_field($_POST['check_in']) : '';
+        $check_out = isset($_POST['check_out']) ? sanitize_text_field($_POST['check_out']) : '';
         
-        if (!$account_id || !$api_key) {
-            error_log('Hostaway Cron: No API credentials configured');
-            return;
+        if (!$listing_id || !$check_in || !$check_out) {
+            wp_send_json_error(array('message' => 'Missing parameters'));
         }
         
+        $account_id = get_option('hostaway_account_id');
+        $api_key = get_option('hostaway_api_key');
         $access_token = $this->get_access_token($account_id, $api_key);
         
         if (!$access_token) {
-            error_log('Hostaway Cron: Failed to get access token');
-            return;
+            wp_send_json_error(array('message' => 'Authentication failed'));
         }
         
-        global $wpdb;
-        $properties = $wpdb->get_results("SELECT listing_id FROM {$this->table_name}");
+        $url = "https://api.hostaway.com/v1/listings/{$listing_id}/calendar/priceDetails?checkIn={$check_in}&checkOut={$check_out}";
         
-        error_log('Hostaway Cron: Syncing availability/prices for ' . count($properties) . ' properties');
-        error_log('Hostaway Cron: Sync completed');
+        $response = wp_remote_get($url, array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $access_token,
+                'Content-Type' => 'application/json'
+            ),
+            'timeout' => 30
+        ));
+        
+        if (is_wp_error($response)) {
+            wp_send_json_error(array('message' => 'Failed to fetch price'));
+        }
+        
+        $body = json_decode(wp_remote_retrieve_body($response));
+        
+        if (isset($body->result->totalPrice)) {
+            wp_send_json_success(array('total_price' => $body->result->totalPrice));
+        } elseif (isset($body->totalPrice)) {
+            wp_send_json_success(array('total_price' => $body->totalPrice));
+        } else {
+            wp_send_json_error(array('message' => 'Price not available'));
+        }
     }
     
     public function ajax_create_booking() {
@@ -730,20 +918,51 @@ class Hostaway_Property_Sync {
             wp_send_json_error(array('message' => 'Missing required fields'));
         }
         
+        // Get property details
+        global $wpdb;
+        $property = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$this->table_name} WHERE listing_id = %s",
+            $listing_id
+        ));
+        
+        if (!$property) {
+            wp_send_json_error(array('message' => 'Property not found'));
+        }
+        
+        // Calculate total price
+        $account_id = get_option('hostaway_account_id');
+        $api_key = get_option('hostaway_api_key');
+        $access_token = $this->get_access_token($account_id, $api_key);
+        
+        $total_price = $property->base_price;
+        if ($access_token) {
+            $price_response = $this->get_price_details_api($listing_id, $check_in, $check_out, $access_token);
+            if ($price_response && isset($price_response['total_price'])) {
+                $total_price = $price_response['total_price'];
+            }
+        }
+        
+        // Create WooCommerce order if WooCommerce is active
+        if (class_exists('WooCommerce')) {
+            $order_id = $this->create_woocommerce_order($property, $guest_name, $guest_email, $guest_phone, $check_in, $check_out, $guests, $total_price);
+            
+            if ($order_id) {
+                wp_send_json_success(array(
+                    'message' => 'Booking created successfully',
+                    'order_id' => $order_id,
+                    'payment_url' => wc_get_order($order_id)->get_checkout_payment_url()
+                ));
+                return;
+            }
+        }
+        
+        // Fallback to direct Hostaway API booking
         $account_id = get_option('hostaway_account_id');
         $api_key = get_option('hostaway_api_key');
         $access_token = $this->get_access_token($account_id, $api_key);
         
         if (!$access_token) {
             wp_send_json_error(array('message' => 'Authentication failed'));
-        }
-        
-        $headers = array('Content-Type' => 'application/json');
-        
-        if (strpos($access_token, 'Basic:') === 0) {
-            $headers['Authorization'] = 'Basic ' . substr($access_token, 6);
-        } else {
-            $headers['Authorization'] = 'Bearer ' . $access_token;
         }
         
         $reservation_data = array(
@@ -759,38 +978,238 @@ class Hostaway_Property_Sync {
             'status' => 'new'
         );
         
-        error_log('Creating Hostaway booking: ' . json_encode($reservation_data));
-        
         $response = wp_remote_post('https://api.hostaway.com/v1/reservations', array(
-            'headers' => $headers,
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $access_token,
+                'Content-Type' => 'application/json'
+            ),
             'body' => json_encode($reservation_data),
             'timeout' => 30
         ));
         
         if (is_wp_error($response)) {
-            error_log('Hostaway Booking Error: ' . $response->get_error_message());
             wp_send_json_error(array('message' => 'Failed to create booking'));
         }
         
-        $response_code = wp_remote_retrieve_response_code($response);
         $body = json_decode(wp_remote_retrieve_body($response));
-        
-        error_log('Hostaway Booking Response Code: ' . $response_code);
-        error_log('Hostaway Booking Response: ' . wp_remote_retrieve_body($response));
+        $response_code = wp_remote_retrieve_response_code($response);
         
         if ($response_code === 200 || $response_code === 201) {
             $reservation_id = isset($body->result->id) ? $body->result->id : (isset($body->id) ? $body->id : null);
             
             wp_send_json_success(array(
                 'message' => 'Booking created successfully',
-                'reservation_id' => $reservation_id,
-                'data' => $body
+                'reservation_id' => $reservation_id
             ));
         } else {
             $error_message = isset($body->message) ? $body->message : 'Failed to create booking';
+            wp_send_json_error(array('message' => $error_message));
+        }
+    }
+    
+    public function sync_availability_prices() {
+        // Placeholder for cron job
+    }
+    
+    private function get_price_details_api($listing_id, $check_in, $check_out, $access_token) {
+        $url = "https://api.hostaway.com/v1/listings/{$listing_id}/calendar/priceDetails?checkIn={$check_in}&checkOut={$check_out}";
+        
+        $response = wp_remote_get($url, array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $access_token,
+                'Content-Type' => 'application/json'
+            ),
+            'timeout' => 30
+        ));
+        
+        if (is_wp_error($response)) {
+            return false;
+        }
+        
+        $body = json_decode(wp_remote_retrieve_body($response));
+        
+        if (isset($body->result->totalPrice)) {
+            return array('total_price' => $body->result->totalPrice);
+        } elseif (isset($body->totalPrice)) {
+            return array('total_price' => $body->totalPrice);
+        }
+        
+        return false;
+    }
+    
+    private function create_woocommerce_order($property, $guest_name, $guest_email, $guest_phone, $check_in, $check_out, $guests, $total_price) {
+        if (!class_exists('WooCommerce')) {
+            return false;
+        }
+        
+        // Create order
+        $order = wc_create_order();
+        
+        if (!$order) {
+            return false;
+        }
+        
+        // Add customer details
+        $order->set_billing_first_name($guest_name);
+        $order->set_billing_email($guest_email);
+        $order->set_billing_phone($guest_phone);
+        
+        // Create product for the booking
+        $product = new WC_Product_Simple();
+        $product->set_name($property->title . ' - Booking');
+        $product->set_price($total_price);
+        $product->set_regular_price($total_price);
+        $product->set_status('publish');
+        $product->save();
+        
+        // Add product to order
+        $order->add_product($product, 1);
+        
+        // Add booking details as meta
+        $order->add_meta_data('_hostaway_listing_id', $property->listing_id);
+        $order->add_meta_data('_hostaway_check_in', $check_in);
+        $order->add_meta_data('_hostaway_check_out', $check_out);
+        $order->add_meta_data('_hostaway_guests', $guests);
+        $order->add_meta_data('_hostaway_property_title', $property->title);
+        
+        // Calculate totals
+        $order->calculate_totals();
+        $order->save();
+        
+        return $order->get_id();
+    }
+    
+    public function sync_booking_to_hostaway($order_id) {
+        if (!class_exists('WooCommerce')) {
+            return;
+        }
+        
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return;
+        }
+        
+        $listing_id = $order->get_meta('_hostaway_listing_id');
+        $check_in = $order->get_meta('_hostaway_check_in');
+        $check_out = $order->get_meta('_hostaway_check_out');
+        $guests = $order->get_meta('_hostaway_guests');
+        
+        if (!$listing_id || !$check_in || !$check_out) {
+            return;
+        }
+        
+        // Check if already synced
+        if ($order->get_meta('_hostaway_synced')) {
+            return;
+        }
+        
+        $account_id = get_option('hostaway_account_id');
+        $api_key = get_option('hostaway_api_key');
+        $access_token = $this->get_access_token($account_id, $api_key);
+        
+        if (!$access_token) {
+            return;
+        }
+        
+        $reservation_data = array(
+            'listingMapId' => intval($listing_id),
+            'channelId' => 2000,
+            'source' => 'website',
+            'arrivalDate' => $check_in,
+            'departureDate' => $check_out,
+            'guestName' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+            'guestEmail' => $order->get_billing_email(),
+            'phone' => $order->get_billing_phone(),
+            'numberOfGuests' => $guests,
+            'status' => 'confirmed'
+        );
+        
+        $response = wp_remote_post('https://api.hostaway.com/v1/reservations', array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $access_token,
+                'Content-Type' => 'application/json'
+            ),
+            'body' => json_encode($reservation_data),
+            'timeout' => 30
+        ));
+        
+        if (!is_wp_error($response)) {
+            $body = json_decode(wp_remote_retrieve_body($response));
+            $response_code = wp_remote_retrieve_response_code($response);
+            
+            if ($response_code === 200 || $response_code === 201) {
+                $reservation_id = isset($body->result->id) ? $body->result->id : (isset($body->id) ? $body->id : null);
+                $order->add_meta_data('_hostaway_reservation_id', $reservation_id);
+                $order->add_meta_data('_hostaway_synced', true);
+                $order->save();
+            }
+        }
+    }
+    
+    public function ajax_create_tables() {
+        if (!wp_doing_ajax()) {
+            wp_die('This method can only be called via AJAX');
+        }
+        
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Unauthorized access'));
+        }
+        
+        try {
+            global $wpdb;
+            $charset_collate = $wpdb->get_charset_collate();
+            
+            $sql = "CREATE TABLE IF NOT EXISTS {$this->table_name} (
+                id bigint(20) NOT NULL AUTO_INCREMENT,
+                listing_id varchar(100) NOT NULL,
+                slug varchar(255) NOT NULL,
+                title varchar(255) NOT NULL,
+                description longtext,
+                city varchar(100),
+                country varchar(100),
+                address text,
+                latitude decimal(10, 8),
+                longitude decimal(11, 8),
+                bedrooms int(11),
+                bathrooms int(11),
+                guests int(11),
+                base_price decimal(10, 2),
+                images longtext,
+                amenities longtext,
+                property_type varchar(100),
+                check_in_time varchar(50),
+                check_out_time varchar(50),
+                house_rules text,
+                created_at datetime,
+                last_synced datetime,
+                PRIMARY KEY (id),
+                UNIQUE KEY listing_id (listing_id),
+                UNIQUE KEY slug (slug),
+                KEY city (city)
+            ) $charset_collate;";
+            
+            $sql_amenities = "CREATE TABLE IF NOT EXISTS {$this->amenities_table} (
+                id bigint(20) NOT NULL AUTO_INCREMENT,
+                amenity_id varchar(100) NOT NULL,
+                amenity_name varchar(255) NOT NULL,
+                is_active tinyint(1) DEFAULT 1,
+                PRIMARY KEY (id),
+                UNIQUE KEY amenity_id (amenity_id)
+            ) $charset_collate;";
+            
+            require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+            $result1 = dbDelta($sql);
+            $result2 = dbDelta($sql_amenities);
+            
+            wp_send_json_success(array(
+                'message' => 'Database tables created successfully!',
+                'properties_table' => $result1,
+                'amenities_table' => $result2
+            ));
+            
+        } catch (Exception $e) {
             wp_send_json_error(array(
-                'message' => $error_message,
-                'debug' => $body
+                'message' => 'Failed to create tables: ' . $e->getMessage()
             ));
         }
     }
@@ -806,70 +1225,7 @@ class Hostaway_Property_Sync {
         $cities = $wpdb->get_col("SELECT DISTINCT city FROM {$this->table_name} WHERE city != ''");
         
         ob_start();
-        ?>
-        <div class="hostaway-search-form">
-            <form id="hostaway-search-form">
-                <div class="search-row">
-                    <div class="search-field">
-                        <label>Location</label>
-                        <select name="location" id="search-location">
-                            <option value="">All Locations</option>
-                            <?php foreach ($cities as $city): ?>
-                                <option value="<?php echo esc_attr($city); ?>"><?php echo esc_html($city); ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
-                    
-                    <div class="search-field">
-                        <label>Check In</label>
-                        <input type="text" name="check_in" id="search-check-in" readonly placeholder="Select date">
-                    </div>
-                    
-                    <div class="search-field">
-                        <label>Check Out</label>
-                        <input type="text" name="check_out" id="search-check-out" readonly placeholder="Select date">
-                    </div>
-                    
-                    <div class="search-field">
-                        <label>Guests</label>
-                        <div class="guests-dropdown">
-                            <input type="text" id="guests-display" readonly placeholder="1 Adult">
-                            <div class="guests-popup" style="display: none;">
-                                <div class="guest-row">
-                                    <span>Adults</span>
-                                    <div class="counter">
-                                        <button type="button" class="minus" data-target="adults">-</button>
-                                        <input type="number" name="adults" id="adults" value="1" min="1" readonly>
-                                        <button type="button" class="plus" data-target="adults">+</button>
-                                    </div>
-                                </div>
-                                <div class="guest-row">
-                                    <span>Children</span>
-                                    <div class="counter">
-                                        <button type="button" class="minus" data-target="children">-</button>
-                                        <input type="number" name="children" id="children" value="0" min="0" readonly>
-                                        <button type="button" class="plus" data-target="children">+</button>
-                                    </div>
-                                </div>
-                                <div class="guest-row">
-                                    <span>Infants</span>
-                                    <div class="counter">
-                                        <button type="button" class="minus" data-target="infants">-</button>
-                                        <input type="number" name="infants" id="infants" value="0" min="0" readonly>
-                                        <button type="button" class="plus" data-target="infants">+</button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="search-field">
-                        <button type="submit" class="search-submit">Search</button>
-                    </div>
-                </div>
-            </form>
-        </div>
-        <?php
+        include plugin_dir_path(__FILE__) . 'templates/search-form.php';
         return ob_get_clean();
     }
     
@@ -878,46 +1234,7 @@ class Hostaway_Property_Sync {
         $amenities = $wpdb->get_results("SELECT * FROM {$this->amenities_table} WHERE is_active = 1");
         
         ob_start();
-        ?>
-        <div class="hostaway-properties-wrapper">
-            <div class="properties-header">
-                <div class="search-filter-controls">
-                    <button id="filter-toggle" class="btn-secondary">Filter</button>
-                    <button id="map-toggle" class="btn-secondary">Show Map</button>
-                    <button id="reset-filters" class="btn-secondary">Reset</button>
-                </div>
-            </div>
-            
-            <div class="filter-popup" style="display: none;">
-                <div class="filter-content">
-                    <h3>Amenities</h3>
-                    <?php if (empty($amenities)): ?>
-                        <p>No amenities configured. Please sync properties first.</p>
-                    <?php else: ?>
-                        <div class="amenities-list">
-                            <?php foreach ($amenities as $amenity): ?>
-                                <label>
-                                    <input type="checkbox" name="amenity_filter" value="<?php echo esc_attr($amenity->amenity_name); ?>">
-                                    <?php echo esc_html($amenity->amenity_name); ?>
-                                </label>
-                            <?php endforeach; ?>
-                        </div>
-                    <?php endif; ?>
-                    <button id="apply-filters" class="btn-primary">Apply Filters</button>
-                </div>
-            </div>
-            
-            <div class="properties-container">
-                <div class="properties-grid" id="properties-grid">
-                    <!-- Properties will be loaded here -->
-                </div>
-                
-                <div class="map-container" id="map-container" style="display: none;">
-                    <div id="properties-map" style="height: 600px; width: 100%;"></div>
-                </div>
-            </div>
-        </div>
-        <?php
+        include plugin_dir_path(__FILE__) . 'templates/properties-shortcode.php';
         return ob_get_clean();
     }
     
@@ -929,111 +1246,58 @@ class Hostaway_Property_Sync {
         global $wpdb;
         $property_count = $wpdb->get_var("SELECT COUNT(*) FROM {$this->table_name}");
         $amenity_count = $wpdb->get_var("SELECT COUNT(*) FROM {$this->amenities_table}");
-        $active_amenity_count = $wpdb->get_var("SELECT COUNT(*) FROM {$this->amenities_table} WHERE is_active = 1");
-        
-        $sample_properties = $wpdb->get_results("SELECT id, listing_id, title, city, slug, images FROM {$this->table_name} LIMIT 5");
-        $sample_amenities = $wpdb->get_results("SELECT * FROM {$this->amenities_table} LIMIT 10");
         
         ob_start();
-        ?>
-        <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h2>Hostaway Debug Information</h2>
-            
-            <h3>Database Status</h3>
-            <ul>
-                <li><strong>Total Properties:</strong> <?php echo $property_count; ?></li>
-                <li><strong>Total Amenities:</strong> <?php echo $amenity_count; ?></li>
-                <li><strong>Active Amenities:</strong> <?php echo $active_amenity_count; ?></li>
-            </ul>
-            
-            <h3>Settings</h3>
-            <ul>
-                <li><strong>Account ID:</strong> <?php echo get_option('hostaway_account_id') ? 'Configured ✓' : 'Not Set ✗'; ?></li>
-                <li><strong>API Key:</strong> <?php echo get_option('hostaway_api_key') ? 'Configured ✓' : 'Not Set ✗'; ?></li>
-                <li><strong>Google Maps Key:</strong> <?php echo get_option('hostaway_google_maps_key') ? 'Configured ✓' : 'Not Set ✗'; ?></li>
-            </ul>
-            
-            <?php if (!empty($sample_properties)): ?>
-            <h3>Sample Properties</h3>
-            <table style="width: 100%; border-collapse: collapse; background: white;">
-                <thead>
-                    <tr style="background: #ddd;">
-                        <th style="padding: 10px; border: 1px solid #ccc;">ID</th>
-                        <th style="padding: 10px; border: 1px solid #ccc;">Listing ID</th>
-                        <th style="padding: 10px; border: 1px solid #ccc;">Title</th>
-                        <th style="padding: 10px; border: 1px solid #ccc;">Slug</th>
-                        <th style="padding: 10px; border: 1px solid #ccc;">City</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($sample_properties as $prop): ?>
-                    <tr>
-                        <td style="padding: 10px; border: 1px solid #ccc;"><?php echo $prop->id; ?></td>
-                        <td style="padding: 10px; border: 1px solid #ccc;"><?php echo $prop->listing_id; ?></td>
-                        <td style="padding: 10px; border: 1px solid #ccc;"><?php echo $prop->title; ?></td>
-                        <td style="padding: 10px; border: 1px solid #ccc;"><?php echo $prop->slug; ?></td>
-                        <td style="padding: 10px; border: 1px solid #ccc;"><?php echo $prop->city; ?></td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-            <?php else: ?>
-            <p style="color: red;"><strong>No properties found in database!</strong> Please sync properties from the Hostaway Settings page.</p>
-            <?php endif; ?>
-            
-            <?php if (!empty($sample_amenities)): ?>
-            <h3>Sample Amenities</h3>
-            <ul>
-                <?php foreach ($sample_amenities as $amenity): ?>
-                <li><?php echo esc_html($amenity->amenity_name); ?> - <?php echo $amenity->is_active ? '✓ Active' : '✗ Inactive'; ?></li>
-                <?php endforeach; ?>
-            </ul>
-            <?php endif; ?>
-            
-            <h3>AJAX Test</h3>
-            <button id="test-ajax" class="btn-primary" style="padding: 10px 20px; background: #C4A574; color: white; border: none; border-radius: 4px; cursor: pointer;">Test Property Loading</button>
-            <div id="ajax-result" style="margin-top: 10px;"></div>
-            
-            <script>
-            jQuery(document).ready(function($) {
-                $('#test-ajax').on('click', function() {
-                    $('#ajax-result').html('Loading...');
-                    $.ajax({
-                        url: '<?php echo admin_url('admin-ajax.php'); ?>',
-                        method: 'POST',
-                        data: {
-                            action: 'hostaway_search',
-                            location: '',
-                            check_in: '',
-                            check_out: '',
-                            adults: 1,
-                            children: 0,
-                            infants: 0,
-                            amenities: []
-                        },
-                        success: function(response) {
-                            console.log('AJAX Response:', response);
-                            if (response.success) {
-                                $('#ajax-result').html('<p style="color: green;">✓ Successfully loaded ' + response.data.count + ' properties</p>');
-                            } else {
-                                $('#ajax-result').html('<p style="color: red;">✗ Error: ' + response.data.message + '</p>');
-                            }
-                        },
-                        error: function(xhr, status, error) {
-                            $('#ajax-result').html('<p style="color: red;">✗ AJAX Error: ' + error + '</p>');
-                            console.error('AJAX Error:', xhr.responseText);
-                        }
-                    });
-                });
-            });
-            </script>
-        </div>
-        <?php
+        echo '<div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border: 1px solid #ddd;">';
+        echo '<h2>Hostaway Plugin Debug Information</h2>';
+        echo '<p><strong>Plugin Version:</strong> 1.0.1</p>';
+        echo '<p><strong>WordPress Version:</strong> ' . get_bloginfo('version') . '</p>';
+        echo '<p><strong>PHP Version:</strong> ' . PHP_VERSION . '</p>';
+        echo '<p><strong>Total Properties:</strong> ' . $property_count . '</p>';
+        echo '<p><strong>Total Amenities:</strong> ' . $amenity_count . '</p>';
+        echo '<p><strong>Account ID:</strong> ' . (get_option('hostaway_account_id') ? 'Set (' . strlen(get_option('hostaway_account_id')) . ' chars)' : 'Not Set') . '</p>';
+        echo '<p><strong>API Key:</strong> ' . (get_option('hostaway_api_key') ? 'Set (' . strlen(get_option('hostaway_api_key')) . ' chars)' : 'Not Set') . '</p>';
+        echo '<p><strong>Google Maps Key:</strong> ' . (get_option('hostaway_google_maps_key') ? 'Set (' . strlen(get_option('hostaway_google_maps_key')) . ' chars)' : 'Not Set') . '</p>';
+        
+        // Test API connection
+        if (get_option('hostaway_account_id') && get_option('hostaway_api_key')) {
+            echo '<h3>API Connection Test</h3>';
+            $access_token = $this->get_access_token(get_option('hostaway_account_id'), get_option('hostaway_api_key'));
+            if ($access_token) {
+                echo '<p style="color: green;">✓ API connection successful</p>';
+                $listings = $this->fetch_listings($access_token);
+                if ($listings && is_array($listings)) {
+                    echo '<p style="color: green;">✓ Found ' . count($listings) . ' listings from API</p>';
+                } else {
+                    echo '<p style="color: red;">✗ No listings returned from API</p>';
+                }
+            } else {
+                echo '<p style="color: red;">✗ API connection failed</p>';
+            }
+        }
+        
+        // Database table check
+        echo '<h3>Database Tables</h3>';
+        $table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$this->table_name}'");
+        if ($table_exists) {
+            echo '<p style="color: green;">✓ Properties table exists</p>';
+        } else {
+            echo '<p style="color: red;">✗ Properties table missing</p>';
+        }
+        
+        $amenities_table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$this->amenities_table}'");
+        if ($amenities_table_exists) {
+            echo '<p style="color: green;">✓ Amenities table exists</p>';
+        } else {
+            echo '<p style="color: red;">✗ Amenities table missing</p>';
+        }
+        
+        echo '</div>';
         return ob_get_clean();
     }
     
     public function enqueue_scripts() {
-        wp_enqueue_style('hostaway-styles', plugin_dir_url(__FILE__) . 'assets/style.css', array(), '1.0.0');
+        wp_enqueue_style('hostaway-styles', plugin_dir_url(__FILE__) . 'assets/style.css', array(), '1.0.1');
         wp_enqueue_script('hostaway-datepicker', 'https://cdn.jsdelivr.net/npm/flatpickr', array(), '1.0.0', true);
         wp_enqueue_style('hostaway-datepicker-css', 'https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css');
         
@@ -1042,7 +1306,7 @@ class Hostaway_Property_Sync {
             wp_enqueue_script('google-maps', "https://maps.googleapis.com/maps/api/js?key={$google_maps_key}", array(), null, true);
         }
         
-        wp_enqueue_script('hostaway-script', plugin_dir_url(__FILE__) . 'assets/script.js', array('jquery', 'hostaway-datepicker'), '1.0.0', true);
+        wp_enqueue_script('hostaway-script', plugin_dir_url(__FILE__) . 'assets/script.js', array('jquery', 'hostaway-datepicker'), '1.0.1', true);
         
         wp_localize_script('hostaway-script', 'hostawayData', array(
             'ajaxurl' => admin_url('admin-ajax.php'),
@@ -1051,9 +1315,6 @@ class Hostaway_Property_Sync {
     }
     
     public function admin_enqueue_scripts($hook) {
-        if ($hook !== 'toplevel_page_hostaway-settings') {
-            return;
-        }
         wp_enqueue_script('jquery');
     }
 }

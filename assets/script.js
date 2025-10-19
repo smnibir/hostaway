@@ -6,10 +6,7 @@ jQuery(document).ready(function($) {
             minDate: 'today',
             dateFormat: 'Y-m-d',
             onChange: function(selectedDates, dateStr) {
-                // Update check-out minimum date
                 checkOutPicker.set('minDate', dateStr);
-                
-                // If check-out is before check-in, clear it
                 const checkOutDate = $('#search-check-out').val();
                 if (checkOutDate && checkOutDate <= dateStr) {
                     $('#search-check-out').val('');
@@ -29,7 +26,6 @@ jQuery(document).ready(function($) {
                 dateFormat: 'Y-m-d',
                 onChange: function(selectedDates, dateStr) {
                     bookingCheckOutPicker.set('minDate', dateStr);
-                    
                     const checkOutDate = $('#booking-check-out').val();
                     if (checkOutDate && checkOutDate <= dateStr) {
                         $('#booking-check-out').val('');
@@ -109,7 +105,6 @@ jQuery(document).ready(function($) {
     
     // Load properties on properties page
     if ($('#properties-grid').length) {
-        // Load all properties on page load
         loadProperties();
     }
     
@@ -187,284 +182,7 @@ jQuery(document).ready(function($) {
             }
             
             imagesHtml += '<div class="property-price">';
-            imagesHtml += '<div class="amount">
-    
-    function getPriceDetails(listingId, checkIn, checkOut, card) {
-        $.ajax({
-            url: hostawayData.ajaxurl,
-            method: 'POST',
-            data: {
-                action: 'get_price_details',
-                listing_id: listingId,
-                check_in: checkIn,
-                check_out: checkOut
-            },
-            success: function(response) {
-                if (response.success) {
-                    card.find('.property-price .amount').text('$' + Math.round(response.data.total_price));
-                    card.find('.property-price .period').text('total');
-                }
-            }
-        });
-    }
-    
-    // Filter toggle
-    $('#filter-toggle').on('click', function() {
-        $('.filter-popup').fadeIn();
-    });
-    
-    $('.filter-popup').on('click', function(e) {
-        if ($(e.target).hasClass('filter-popup')) {
-            $(this).fadeOut();
-        }
-    });
-    
-    // Apply filters
-    $('#apply-filters').on('click', function() {
-        $('.filter-popup').fadeOut();
-        loadProperties();
-    });
-    
-    // Map toggle
-    $('#map-toggle').on('click', function() {
-        var mapContainer = $('#map-container');
-        var grid = $('#properties-grid');
-        
-        if (mapContainer.is(':visible')) {
-            mapContainer.hide();
-            grid.removeClass('with-map');
-            $(this).text('Show Map');
-        } else {
-            mapContainer.show();
-            grid.addClass('with-map');
-            $(this).text('Hide Map');
-            
-            // Initialize map if not already done
-            if (!window.hostawayMap) {
-                var properties = [];
-                $('.property-card').each(function() {
-                    properties.push({
-                        listing_id: $(this).data('listing-id'),
-                        latitude: parseFloat($(this).data('lat')),
-                        longitude: parseFloat($(this).data('lng')),
-                        title: $(this).find('.property-title').text(),
-                        price: $(this).find('.property-price .amount').text(),
-                        image: $(this).find('.property-images img').first().attr('src')
-                    });
-                });
-                initMap(properties);
-            }
-        }
-    });
-    
-    // Reset filters
-    $('#reset-filters').on('click', function() {
-        $('input[name="amenity_filter"]').prop('checked', false);
-        window.location.href = '/properties';
-    });
-    
-    // Initialize Google Map
-    function initMap(properties) {
-        if (typeof google === 'undefined' || !google.maps) {
-            console.error('Google Maps API not loaded');
-            return;
-        }
-        
-        var mapElement = document.getElementById('properties-map');
-        if (!mapElement) return;
-        
-        var bounds = new google.maps.LatLngBounds();
-        var center = { lat: 0, lng: 0 };
-        
-        if (properties.length > 0 && properties[0].latitude && properties[0].longitude) {
-            center = { lat: parseFloat(properties[0].latitude), lng: parseFloat(properties[0].longitude) };
-        }
-        
-        var map = new google.maps.Map(mapElement, {
-            center: center,
-            zoom: 12,
-            styles: [
-                {
-                    featureType: 'poi',
-                    elementType: 'labels',
-                    stylers: [{ visibility: 'off' }]
-                }
-            ]
-        });
-        
-        window.hostawayMap = map;
-        
-        properties.forEach(function(property) {
-            if (!property.latitude || !property.longitude) return;
-            
-            var position = {
-                lat: parseFloat(property.latitude),
-                lng: parseFloat(property.longitude)
-            };
-            
-            var marker = new google.maps.Marker({
-                position: position,
-                map: map,
-                title: property.title
-            });
-            
-            bounds.extend(position);
-            
-            var infoContent = '<div class="map-popup">';
-            if (property.image) {
-                infoContent += '<img src="' + property.image + '" alt="' + property.title + '">';
-            }
-            infoContent += '<h4>' + property.title + '</h4>';
-            infoContent += '<div class="price">' + property.price + '</div>';
-            infoContent += '</div>';
-            
-            var infowindow = new google.maps.InfoWindow({
-                content: infoContent
-            });
-            
-            marker.addListener('mouseover', function() {
-                infowindow.open(map, marker);
-            });
-            
-            marker.addListener('mouseout', function() {
-                infowindow.close();
-            });
-            
-            marker.addListener('click', function() {
-                var slug = property.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-                window.location.href = '/properties/' + slug;
-            });
-        });
-        
-        if (properties.length > 1) {
-            map.fitBounds(bounds);
-        }
-    }
-    
-    // Single property page - gallery
-    $('.gallery-thumb').on('click', function() {
-        var imgSrc = $(this).find('img').attr('src');
-        $('.gallery-main img').attr('src', imgSrc);
-    });
-    
-    // Single property page - date pickers
-    if (typeof flatpickr !== 'undefined' && $('#booking-check-in').length) {
-        const bookingCheckInPicker = flatpickr('#booking-check-in', {
-            minDate: 'today',
-            dateFormat: 'Y-m-d',
-            onChange: function(selectedDates, dateStr) {
-                bookingCheckOutPicker.set('minDate', dateStr);
-                const checkOutDate = $('#booking-check-out').val();
-                if (checkOutDate && checkOutDate <= dateStr) {
-                    $('#booking-check-out').val('');
-                }
-                updateBookingPrice();
-            }
-        });
-        
-        const bookingCheckOutPicker = flatpickr('#booking-check-out', {
-            minDate: 'today',
-            dateFormat: 'Y-m-d',
-            onChange: function() {
-                updateBookingPrice();
-            }
-        });
-    }
-    
-    function updateBookingPrice() {
-        var listingId = $('#booking-listing-id').val();
-        var checkIn = $('#booking-check-in').val();
-        var checkOut = $('#booking-check-out').val();
-        
-        if (!listingId || !checkIn || !checkOut) return;
-        
-        // Calculate number of nights
-        var checkInDate = new Date(checkIn);
-        var checkOutDate = new Date(checkOut);
-        var timeDiff = checkOutDate - checkInDate;
-        var nights = Math.ceil(timeDiff / (1000 * 3600 * 24));
-        
-        if (nights > 0) {
-            $('#nights-count').text(nights + ' night' + (nights > 1 ? 's' : ''));
-        }
-        
-        $.ajax({
-            url: hostawayData.ajaxurl,
-            method: 'POST',
-            data: {
-                action: 'get_price_details',
-                listing_id: listingId,
-                check_in: checkIn,
-                check_out: checkOut
-            },
-            success: function(response) {
-                if (response.success) {
-                    var totalPrice = response.data.total_price;
-                    $('#total-price').text('
-    
-}); + Math.round(totalPrice));
-                    $('.booking-price').html('
-    
-}); + Math.round(totalPrice) + ' <span style="font-size: 16px; font-weight: normal;">total</span>');
-                }
-            },
-            error: function() {
-                console.error('Failed to get price details');
-            }
-        });
-    }
-    
-    // Booking form submission
-    $('#booking-form').on('submit', function(e) {
-        e.preventDefault();
-        
-        var formData = {
-            action: 'create_booking',
-            nonce: hostawayData.nonce,
-            listing_id: $('#booking-listing-id').val(),
-            check_in: $('#booking-check-in').val(),
-            check_out: $('#booking-check-out').val(),
-            guests: $('#booking-guests').val(),
-            guest_name: $('#guest-name').val(),
-            guest_email: $('#guest-email').val(),
-            guest_phone: $('#guest-phone').val()
-        };
-        
-        var submitBtn = $(this).find('.book-now-btn');
-        var messageDiv = $('#booking-message');
-        
-        submitBtn.prop('disabled', true).text('Processing...');
-        messageDiv.html('');
-        
-        $.ajax({
-            url: hostawayData.ajaxurl,
-            method: 'POST',
-            data: formData,
-            success: function(response) {
-                if (response.success) {
-                    messageDiv.html('<p style="color: green; font-weight: bold;">✓ Booking created successfully! Reservation ID: ' + response.data.reservation_id + '</p>');
-                    messageDiv.append('<p>You will receive a confirmation email shortly.</p>');
-                    
-                    // Reset form after 3 seconds
-                    setTimeout(function() {
-                        $('#booking-form')[0].reset();
-                        messageDiv.html('');
-                        submitBtn.prop('disabled', false).text('Book Now');
-                    }, 5000);
-                } else {
-                    messageDiv.html('<p style="color: red;">✗ Error: ' + response.data.message + '</p>');
-                    submitBtn.prop('disabled', false).text('Book Now');
-                }
-            },
-            error: function(xhr, status, error) {
-                console.error('Booking error:', error);
-                messageDiv.html('<p style="color: red;">✗ Failed to create booking. Please try again.</p>');
-                submitBtn.prop('disabled', false).text('Book Now');
-            }
-        });
-    });
-    
-}); + Math.round(property.base_price) + '</div>';
+            imagesHtml += '<div class="amount">$' + Math.round(property.base_price) + '</div>';
             imagesHtml += '<div class="period">per night</div>';
             imagesHtml += '</div>';
             imagesHtml += '</div>';
@@ -676,30 +394,7 @@ jQuery(document).ready(function($) {
         $('.gallery-main img').attr('src', imgSrc);
     });
     
-    // Single property page - date pickers
-    if (typeof flatpickr !== 'undefined' && $('#booking-check-in').length) {
-        const bookingCheckInPicker = flatpickr('#booking-check-in', {
-            minDate: 'today',
-            dateFormat: 'Y-m-d',
-            onChange: function(selectedDates, dateStr) {
-                bookingCheckOutPicker.set('minDate', dateStr);
-                const checkOutDate = $('#booking-check-out').val();
-                if (checkOutDate && checkOutDate <= dateStr) {
-                    $('#booking-check-out').val('');
-                }
-                updateBookingPrice();
-            }
-        });
-        
-        const bookingCheckOutPicker = flatpickr('#booking-check-out', {
-            minDate: 'today',
-            dateFormat: 'Y-m-d',
-            onChange: function() {
-                updateBookingPrice();
-            }
-        });
-    }
-    
+    // Single property booking price update
     function updateBookingPrice() {
         var listingId = $('#booking-listing-id').val();
         var checkIn = $('#booking-check-in').val();
@@ -729,12 +424,8 @@ jQuery(document).ready(function($) {
             success: function(response) {
                 if (response.success) {
                     var totalPrice = response.data.total_price;
-                    $('#total-price').text('
-    
-}); + Math.round(totalPrice));
-                    $('.booking-price').html('
-    
-}); + Math.round(totalPrice) + ' <span style="font-size: 16px; font-weight: normal;">total</span>');
+                    $('#total-price').text('$' + Math.round(totalPrice));
+                    $('.booking-price').html('$' + Math.round(totalPrice) + ' <span style="font-size: 16px; font-weight: normal;">total</span>');
                 }
             },
             error: function() {
@@ -771,15 +462,25 @@ jQuery(document).ready(function($) {
             data: formData,
             success: function(response) {
                 if (response.success) {
-                    messageDiv.html('<p style="color: green; font-weight: bold;">✓ Booking created successfully! Reservation ID: ' + response.data.reservation_id + '</p>');
-                    messageDiv.append('<p>You will receive a confirmation email shortly.</p>');
-                    
-                    // Reset form after 3 seconds
-                    setTimeout(function() {
-                        $('#booking-form')[0].reset();
-                        messageDiv.html('');
-                        submitBtn.prop('disabled', false).text('Book Now');
-                    }, 5000);
+                    if (response.data.payment_url) {
+                        // WooCommerce order created, redirect to payment
+                        messageDiv.html('<p style="color: green; font-weight: bold;">✓ Booking created successfully!</p>');
+                        messageDiv.append('<p>Redirecting to payment...</p>');
+                        setTimeout(function() {
+                            window.location.href = response.data.payment_url;
+                        }, 2000);
+                    } else {
+                        // Direct Hostaway booking
+                        messageDiv.html('<p style="color: green; font-weight: bold;">✓ Booking created successfully! Reservation ID: ' + response.data.reservation_id + '</p>');
+                        messageDiv.append('<p>You will receive a confirmation email shortly.</p>');
+                        
+                        // Reset form after 5 seconds
+                        setTimeout(function() {
+                            $('#booking-form')[0].reset();
+                            messageDiv.html('');
+                            submitBtn.prop('disabled', false).text('Book Now');
+                        }, 5000);
+                    }
                 } else {
                     messageDiv.html('<p style="color: red;">✗ Error: ' + response.data.message + '</p>');
                     submitBtn.prop('disabled', false).text('Book Now');
